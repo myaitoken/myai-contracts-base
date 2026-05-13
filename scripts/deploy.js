@@ -8,6 +8,10 @@ async function main() {
   const TREASURY    = "0xEECf384A2d4D0eaE2EA3980Fb2eDE753Dd6d4716";
   const COORDINATOR = deployer.address;
 
+  console.log("MYAI Token:  ", MYAI_TOKEN);
+  console.log("Treasury:    ", TREASURY);
+  console.log("Coordinator: ", COORDINATOR);
+
   const Escrow = await hre.ethers.getContractFactory("MyAIEscrow");
   const escrow = await Escrow.deploy(MYAI_TOKEN, COORDINATOR, TREASURY);
   await escrow.waitForDeployment();
@@ -26,7 +30,7 @@ async function main() {
   const governanceAddr = await governance.getAddress();
   console.log("MyAIGovernance deployed:", governanceAddr);
 
-  console.log("\n=== Add to coordinator .env ===");
+  console.log("\n=== Add these to coordinator .env ===");
   console.log("ESCROW_ADDRESS=" + escrowAddr);
   console.log("REPUTATION_ADDRESS=" + reputationAddr);
   console.log("GOVERNANCE_ADDRESS=" + governanceAddr);
