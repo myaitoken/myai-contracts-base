@@ -12,17 +12,21 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
  * @dev Requesters lock MYAI tokens when submitting jobs.
  *      Coordinator oracle releases/refunds based on Proof-of-Compute.
  *      20% of every payment is burned (BME mechanics).
+ *      Protocol fee starts at 3% (feeBps=300) and is adjustable by owner (max 10%).
  */
 contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
     IERC20 public immutable myaiToken;
     address public coordinator;  // Oracle: MyAI coordinator service
 
-    // Fee split (basis points, total = 10000)
-    uint256 public constant PROVIDER_BPS = 7300;  // 73% to provider
-    uint256 public constant BURN_BPS     = 2000;  // 20% burned (BME)
-    uint256 public constant PROTOCOL_BPS = 700;   // 7% to protocol treasury
-    address public protocolTreasury;
+    // Burn BPS is constant — immutable BME mechanic
+    uint256 public constant BURN_BPS = 2000;       // 20% burned
+    uint256 public constant MAX_FEE_BPS = 1000;    // Protocol fee ceiling: 10%
+    uint256 public constant BURN_ADDRESS_CONST = 0xdead;
     address public constant BURN_ADDRESS = address(0xdead);
+
+    // Adjustable protocol fee: starts at 3%, owner can change within MAX_FEE_BPS
+    uint256 public feeBps = 300;   // 3% default
+    address public protocolTreasury;
 
     struct Escrow {
         address requester;
@@ -41,11 +45,17 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
     mapping(bytes32 => Escrow) public escrows;
     bytes32[] public escrowIds;
 
+    // Cumulative fee tracking
+    uint256 public totalFeesEarned;
+    uint256 public totalBurned;
+
     event PaymentLocked(bytes32 indexed jobId, address indexed requester, address indexed provider, uint256 amount);
-    event PaymentReleased(bytes32 indexed jobId, address indexed provider, uint256 providerAmount, uint256 burned);
+    event PaymentReleased(bytes32 indexed jobId, address indexed provider, uint256 providerAmount, uint256 burned, uint256 fee);
     event PaymentRefunded(bytes32 indexed jobId, address indexed requester, uint256 amount);
     event PaymentExpired(bytes32 indexed jobId, address indexed requester, uint256 amount);
     event CoordinatorUpdated(address indexed newCoordinator);
+    event FeeBpsUpdated(uint256 oldFeeBps, uint256 newFeeBps);
+    event TreasuryUpdated(address indexed newTreasury);
 
     modifier onlyCoordinator() {
         require(msg.sender == coordinator || msg.sender == owner(), "Not coordinator");
@@ -58,12 +68,8 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
         protocolTreasury = _treasury;
     }
 
-    /**
-     * @notice Lock MYAI payment when requester submits a job.
-     * @param jobId Unique job identifier
-     * @param provider Provider's wallet address
-     * @param amount MYAI amount to lock (in wei)
-     */
+    // ─── Locking ─────────────────────────────────────────────────────────────
+
     function lockPayment(
         bytes32 jobId,
         address provider,
@@ -88,11 +94,8 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
         emit PaymentLocked(jobId, msg.sender, provider, amount);
     }
 
-    /**
-     * @notice Release payment to provider after Proof-of-Compute verification.
-     * @param jobId Job identifier
-     * @param pocHash Hash of the verified compute output
-     */
+    // ─── Settlement ───────────────────────────────────────────────────────────
+
     function releasePayment(
         bytes32 jobId,
         bytes32 pocHash
@@ -105,21 +108,22 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
         escrow.pocHash = pocHash;
 
         uint256 total = escrow.amount;
-        uint256 providerAmount = (total * PROVIDER_BPS) / 10000;
+        uint256 feeAmount      = (total * feeBps) / 10000;
         uint256 burnAmount     = (total * BURN_BPS) / 10000;
-        uint256 protocolAmount = total - providerAmount - burnAmount;
+        uint256 providerAmount = total - feeAmount - burnAmount;
+
+        totalFeesEarned += feeAmount;
+        totalBurned     += burnAmount;
 
         require(myaiToken.transfer(escrow.provider, providerAmount), "Provider transfer failed");
         require(myaiToken.transfer(BURN_ADDRESS, burnAmount), "Burn transfer failed");
-        require(myaiToken.transfer(protocolTreasury, protocolAmount), "Treasury transfer failed");
+        if (feeAmount > 0) {
+            require(myaiToken.transfer(protocolTreasury, feeAmount), "Treasury transfer failed");
+        }
 
-        emit PaymentReleased(jobId, escrow.provider, providerAmount, burnAmount);
+        emit PaymentReleased(jobId, escrow.provider, providerAmount, burnAmount, feeAmount);
     }
 
-    /**
-     * @notice Refund requester if PoC fails or job is cancelled.
-     * @param jobId Job identifier
-     */
     function refundPayment(bytes32 jobId) external onlyCoordinator nonReentrant {
         Escrow storage escrow = escrows[jobId];
         require(escrow.status == EscrowStatus.Locked, "Escrow not active");
@@ -130,9 +134,6 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
         emit PaymentRefunded(jobId, escrow.requester, escrow.amount);
     }
 
-    /**
-     * @notice Allow requester to claim expired escrow after timeout.
-     */
     function claimExpired(bytes32 jobId) external nonReentrant {
         Escrow storage escrow = escrows[jobId];
         require(escrow.requester == msg.sender, "Not requester");
@@ -145,13 +146,39 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
         emit PaymentExpired(jobId, escrow.requester, escrow.amount);
     }
 
+    // ─── View ─────────────────────────────────────────────────────────────────
+
     function getEscrow(bytes32 jobId) external view returns (Escrow memory) {
         return escrows[jobId];
+    }
+
+    function previewSplit(uint256 amount) external view returns (
+        uint256 providerAmount,
+        uint256 burnAmount,
+        uint256 feeAmount
+    ) {
+        feeAmount      = (amount * feeBps) / 10000;
+        burnAmount     = (amount * BURN_BPS) / 10000;
+        providerAmount = amount - feeAmount - burnAmount;
+    }
+
+    // ─── Admin ────────────────────────────────────────────────────────────────
+
+    function setFeeBps(uint256 _feeBps) external onlyOwner {
+        require(_feeBps <= MAX_FEE_BPS, "Exceeds 10% cap");
+        emit FeeBpsUpdated(feeBps, _feeBps);
+        feeBps = _feeBps;
     }
 
     function setCoordinator(address _coordinator) external onlyOwner {
         coordinator = _coordinator;
         emit CoordinatorUpdated(_coordinator);
+    }
+
+    function setTreasury(address _treasury) external onlyOwner {
+        require(_treasury != address(0), "Zero address");
+        protocolTreasury = _treasury;
+        emit TreasuryUpdated(_treasury);
     }
 
     function setEscrowTimeout(uint256 _timeout) external onlyOwner {
