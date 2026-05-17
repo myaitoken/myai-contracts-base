@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title MyAIReputation
@@ -11,9 +13,10 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  *      Reputation = weighted combination of success rate, PoC rate, and latency.
  *      Slashing for consecutive failures. Vouching for trust propagation.
  */
-contract MyAIReputation is Ownable {
+contract MyAIReputation is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
     address public coordinator;
-    IERC20 public myaiToken;
+    IERC20 public immutable myaiToken;
 
     struct AgentProfile {
         uint256 totalJobs;
@@ -58,6 +61,8 @@ contract MyAIReputation is Ownable {
     }
 
     constructor(address _coordinator, address _myaiToken) Ownable(msg.sender) {
+        require(_coordinator != address(0), "Coordinator zero");
+        require(_myaiToken   != address(0), "Token zero");
         coordinator = _coordinator;
         myaiToken = IERC20(_myaiToken);
     }
@@ -123,8 +128,9 @@ contract MyAIReputation is Ownable {
         if (p.totalJobs > 0) {
             uint256 successScore = (p.successfulJobs * SUCCESS_WEIGHT) / p.totalJobs;
             uint256 pocScore     = (p.pocVerifiedJobs * POC_WEIGHT) / p.totalJobs;
-            uint256 latencyScore = latencyMs < MAX_LATENCY_MS
-                ? ((MAX_LATENCY_MS - latencyMs) * LATENCY_WEIGHT) / MAX_LATENCY_MS
+            uint256 latRef = p.avgLatencyMs;
+            uint256 latencyScore = latRef < MAX_LATENCY_MS
+                ? ((MAX_LATENCY_MS - latRef) * LATENCY_WEIGHT) / MAX_LATENCY_MS
                 : 0;
             p.reputationScore = successScore + pocScore + latencyScore;
         }
@@ -135,16 +141,18 @@ contract MyAIReputation is Ownable {
     /**
      * @notice Stake MYAI tokens to boost reputation.
      */
-    function stake(uint256 amount) external {
+    function stake(uint256 amount) external nonReentrant {
         require(amount > 0, "Amount must be > 0");
-        require(myaiToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+        // Effects first (CEI) -- fix for slither H-1
         profiles[msg.sender].stakedAmount += amount;
-        uint256 boost = (amount / 1e18) * 10; // 10bp per token staked
-        if (boost > 500) boost = 500;          // Max 5% boost from staking
+        uint256 boost = (amount / 1e18) * 10;
+        if (boost > 500) boost = 500;
         profiles[msg.sender].reputationScore =
             profiles[msg.sender].reputationScore + boost > 10000
             ? 10000
             : profiles[msg.sender].reputationScore + boost;
+        // Interaction last
+        myaiToken.safeTransferFrom(msg.sender, address(this), amount);
         emit Staked(msg.sender, amount);
     }
 
@@ -191,8 +199,12 @@ contract MyAIReputation is Ownable {
         return (top, scores);
     }
 
+    event CoordinatorUpdated(address indexed newCoordinator);
+
     function setCoordinator(address _coordinator) external onlyOwner {
+        require(_coordinator != address(0), "Zero address");
         coordinator = _coordinator;
+        emit CoordinatorUpdated(_coordinator);
     }
 
     function totalAgents() external view returns (uint256) {

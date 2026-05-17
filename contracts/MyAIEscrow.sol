@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
@@ -15,13 +16,13 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
  *      Protocol fee starts at 3% (feeBps=300) and is adjustable by owner (max 10%).
  */
 contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
+    using SafeERC20 for IERC20;
     IERC20 public immutable myaiToken;
     address public coordinator;  // Oracle: MyAI coordinator service
 
     // Burn BPS is constant — immutable BME mechanic
     uint256 public constant BURN_BPS = 2000;       // 20% burned
     uint256 public constant MAX_FEE_BPS = 1000;    // Protocol fee ceiling: 10%
-    uint256 public constant BURN_ADDRESS_CONST = 0xdead;
     address public constant BURN_ADDRESS = address(0xdead);
 
     // Adjustable protocol fee: starts at 3%, owner can change within MAX_FEE_BPS
@@ -56,6 +57,7 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
     event CoordinatorUpdated(address indexed newCoordinator);
     event FeeBpsUpdated(uint256 oldFeeBps, uint256 newFeeBps);
     event TreasuryUpdated(address indexed newTreasury);
+    event EscrowTimeoutUpdated(uint256 oldTimeout, uint256 newTimeout);
 
     modifier onlyCoordinator() {
         require(msg.sender == coordinator || msg.sender == owner(), "Not coordinator");
@@ -63,6 +65,9 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
     }
 
     constructor(address _myaiToken, address _coordinator, address _treasury) Ownable(msg.sender) {
+        require(_myaiToken != address(0), "Token zero");
+        require(_coordinator != address(0), "Coordinator zero");
+        require(_treasury != address(0), "Treasury zero");
         myaiToken = IERC20(_myaiToken);
         coordinator = _coordinator;
         protocolTreasury = _treasury;
@@ -78,8 +83,8 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
         require(escrows[jobId].lockedAt == 0, "Job already escrowed");
         require(provider != address(0), "Invalid provider");
         require(amount > 0, "Amount must be > 0");
-        require(myaiToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
 
+        // Effects first (CEI) -- fix for slither H-1 reentrancy-no-eth
         escrows[jobId] = Escrow({
             requester: msg.sender,
             provider: provider,
@@ -91,6 +96,9 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
         });
         escrowIds.push(jobId);
 
+        // Interaction last
+        myaiToken.safeTransferFrom(msg.sender, address(this), amount);
+
         emit PaymentLocked(jobId, msg.sender, provider, amount);
     }
 
@@ -99,7 +107,7 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
     function releasePayment(
         bytes32 jobId,
         bytes32 pocHash
-    ) external onlyCoordinator nonReentrant {
+    ) external nonReentrant onlyCoordinator {
         Escrow storage escrow = escrows[jobId];
         require(escrow.status == EscrowStatus.Locked, "Escrow not active");
         require(escrow.lockedAt > 0, "Escrow not found");
@@ -115,21 +123,21 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
         totalFeesEarned += feeAmount;
         totalBurned     += burnAmount;
 
-        require(myaiToken.transfer(escrow.provider, providerAmount), "Provider transfer failed");
-        require(myaiToken.transfer(BURN_ADDRESS, burnAmount), "Burn transfer failed");
+        myaiToken.safeTransfer(escrow.provider, providerAmount);
+        myaiToken.safeTransfer(BURN_ADDRESS, burnAmount);
         if (feeAmount > 0) {
-            require(myaiToken.transfer(protocolTreasury, feeAmount), "Treasury transfer failed");
+            myaiToken.safeTransfer(protocolTreasury, feeAmount);
         }
 
         emit PaymentReleased(jobId, escrow.provider, providerAmount, burnAmount, feeAmount);
     }
 
-    function refundPayment(bytes32 jobId) external onlyCoordinator nonReentrant {
+    function refundPayment(bytes32 jobId) external nonReentrant onlyCoordinator {
         Escrow storage escrow = escrows[jobId];
         require(escrow.status == EscrowStatus.Locked, "Escrow not active");
 
         escrow.status = EscrowStatus.Refunded;
-        require(myaiToken.transfer(escrow.requester, escrow.amount), "Refund failed");
+        myaiToken.safeTransfer(escrow.requester, escrow.amount);
 
         emit PaymentRefunded(jobId, escrow.requester, escrow.amount);
     }
@@ -141,7 +149,7 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
         require(block.timestamp > escrow.lockedAt + escrowTimeout, "Not expired yet");
 
         escrow.status = EscrowStatus.Expired;
-        require(myaiToken.transfer(escrow.requester, escrow.amount), "Refund failed");
+        myaiToken.safeTransfer(escrow.requester, escrow.amount);
 
         emit PaymentExpired(jobId, escrow.requester, escrow.amount);
     }
@@ -171,6 +179,7 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
     }
 
     function setCoordinator(address _coordinator) external onlyOwner {
+        require(_coordinator != address(0), "Zero address");
         coordinator = _coordinator;
         emit CoordinatorUpdated(_coordinator);
     }
@@ -182,6 +191,8 @@ contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
     }
 
     function setEscrowTimeout(uint256 _timeout) external onlyOwner {
+        require(_timeout >= 5 minutes && _timeout <= 30 days, "Timeout out of range");
+        emit EscrowTimeoutUpdated(escrowTimeout, _timeout);
         escrowTimeout = _timeout;
     }
 

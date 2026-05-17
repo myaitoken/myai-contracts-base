@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./MyAIReputation.sol";
 
 /**
@@ -11,8 +12,8 @@ import "./MyAIReputation.sol";
  *      Any agent with 100+ governance points can propose.
  *      48h timelock before execution.
  */
-contract MyAIGovernance is Ownable {
-    MyAIReputation public reputation;
+contract MyAIGovernance is Ownable, ReentrancyGuard {
+    MyAIReputation public immutable reputation;
 
     enum ProposalStatus { Pending, Active, Passed, Failed, Executed, Cancelled }
 
@@ -48,6 +49,7 @@ contract MyAIGovernance is Ownable {
     event ProposalExecuted(uint256 indexed id);
 
     constructor(address _reputation) Ownable(msg.sender) {
+        require(_reputation != address(0), "Reputation zero");
         reputation = MyAIReputation(_reputation);
     }
 
@@ -125,7 +127,7 @@ contract MyAIGovernance is Ownable {
         }
     }
 
-    function execute(uint256 proposalId) external {
+    function execute(uint256 proposalId) external nonReentrant {
         Proposal storage p = proposals[proposalId];
         require(p.status == ProposalStatus.Passed, "Not passed");
         require(block.timestamp >= p.executionAvailableAt, "Timelock not expired");
