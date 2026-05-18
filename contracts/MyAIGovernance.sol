@@ -11,6 +11,8 @@ import "./MyAIReputation.sol";
  * @dev Voting weight = staked MYAI + governance points from verified jobs.
  *      Any agent with 100+ governance points can propose.
  *      48h timelock before execution.
+ *      Quorum: participation (votesFor + votesAgainst) must be >= quorumBps
+ *      of the total eligible voting weight snapshotted at proposal creation.
  */
 contract MyAIGovernance is Ownable, ReentrancyGuard {
     MyAIReputation public immutable reputation;
@@ -22,27 +24,33 @@ contract MyAIGovernance is Ownable, ReentrancyGuard {
         address proposer;
         string title;
         string description;
-        bytes callData;               // Encoded function call to execute
-        address target;               // Contract to call
+        bytes callData;                  // Encoded function call to execute
+        address target;                  // Contract to call
         uint256 createdAt;
         uint256 votingEndsAt;
-        uint256 executionAvailableAt; // createdAt + votingPeriod + timelock
+        uint256 executionAvailableAt;    // createdAt + votingPeriod + timelock
         uint256 votesFor;
         uint256 votesAgainst;
         uint256 totalVotingWeight;
+        uint256 eligibleVotingWeight;    // Snapshot of total eligible weight at creation
         ProposalStatus status;
     }
 
     uint256 public proposalCount;
-    uint256 public votingPeriod     = 3 days;
-    uint256 public timelockPeriod   = 48 hours;
-    uint256 public quorumBps        = 1000;  // 10% quorum
-    uint256 public proposalThreshold = 100;  // 100 governance points to propose
+    uint256 public votingPeriod      = 3 days;
+    uint256 public timelockPeriod    = 48 hours;
+    uint256 public quorumBps         = 1000;  // 10% quorum
+    uint256 public proposalThreshold = 100;   // 100 governance points to propose
+
+    uint256 public constant BPS_DENOMINATOR = 10000;
 
     mapping(uint256 => Proposal) public proposals;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
 
-    event ProposalCreated(uint256 indexed id, address indexed proposer, string title);
+    /// @dev Reverts when finalize() is called and participation < quorumBps.
+    error QuorumNotMet(uint256 participationBps, uint256 requiredBps);
+
+    event ProposalCreated(uint256 indexed id, address indexed proposer, string title, uint256 eligibleVotingWeight);
     event VoteCast(uint256 indexed proposalId, address indexed voter, bool support, uint256 weight);
     event ProposalPassed(uint256 indexed id);
     event ProposalFailed(uint256 indexed id);
@@ -59,6 +67,19 @@ contract MyAIGovernance is Ownable, ReentrancyGuard {
         return profile.governancePoints + stakedWeight;
     }
 
+    /**
+     * @notice Sum voting weight across all registered agents. Used to snapshot the
+     *         quorum denominator at proposal-creation time.
+     * @dev O(N) over registeredAgents; bounded because agent set is on-chain registered.
+     */
+    function getTotalEligibleVotingWeight() public view returns (uint256 total) {
+        uint256 n = reputation.totalAgents();
+        for (uint256 i = 0; i < n; i++) {
+            address agent = reputation.registeredAgents(i);
+            total += getVotingWeight(agent);
+        }
+    }
+
     function propose(
         string calldata title,
         string calldata description,
@@ -69,6 +90,8 @@ contract MyAIGovernance is Ownable, ReentrancyGuard {
 
         proposalCount++;
         uint256 id = proposalCount;
+
+        uint256 eligible = getTotalEligibleVotingWeight();
 
         proposals[id] = Proposal({
             id: id,
@@ -83,10 +106,11 @@ contract MyAIGovernance is Ownable, ReentrancyGuard {
             votesFor: 0,
             votesAgainst: 0,
             totalVotingWeight: 0,
+            eligibleVotingWeight: eligible,
             status: ProposalStatus.Active
         });
 
-        emit ProposalCreated(id, msg.sender, title);
+        emit ProposalCreated(id, msg.sender, title, eligible);
         return id;
     }
 
@@ -111,10 +135,29 @@ contract MyAIGovernance is Ownable, ReentrancyGuard {
         emit VoteCast(proposalId, msg.sender, support, weight);
     }
 
+    /**
+     * @notice Tally a proposal after voting ends. Enforces quorum:
+     *         (votesFor + votesAgainst) * 10000 / eligibleVotingWeight >= quorumBps.
+     *         Reverts with QuorumNotMet otherwise (proposal stays Active so
+     *         participants can still vote up to votingEndsAt; once past that,
+     *         under-quorum proposals are effectively dead).
+     */
     function finalize(uint256 proposalId) external {
         Proposal storage p = proposals[proposalId];
         require(p.status == ProposalStatus.Active, "Not active");
         require(block.timestamp > p.votingEndsAt, "Voting not ended");
+
+        uint256 turnout = p.votesFor + p.votesAgainst;
+        uint256 eligible = p.eligibleVotingWeight;
+
+        if (eligible > 0) {
+            uint256 participationBps = (turnout * BPS_DENOMINATOR) / eligible;
+            if (participationBps < quorumBps) {
+                revert QuorumNotMet(participationBps, quorumBps);
+            }
+        }
+        // If eligible == 0 we treat the proposal as fail-safe failed below
+        // (votesFor cannot exceed votesAgainst with no electorate).
 
         bool passed = p.votesFor > p.votesAgainst;
 
