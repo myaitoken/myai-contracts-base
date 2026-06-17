@@ -2,13 +2,18 @@
 pragma solidity ^0.8.17;
 
 /**
- * @title MyAi Protocol Escrow (LEGACY — DEPRECATED)
- * @custom:deprecated Superseded by MyAIEscrow.sol. This is the source of the
- *   originally-deployed escrow (Base 0x280Be8…); it LACKS refund()/selfRefund().
- *   Kept only for provenance of the live bytecode. NOT in the audit scope and
- *   intentionally untested — do NOT deploy. The canonical escrow is MyAIEscrow
- *   (refund/selfRefund + adjustable fee); see board card 9394 for the V2
- *   on-chain redeploy that replaces this contract.
+ * @title MyAi Protocol Escrow  (deposit/release line — 9394 redeploy candidate)
+ * @custom:status This is the SAME interface family as the live escrow
+ *   (Base 0x280Be8…: deposit / release / jobs / previewSplit / FEE_BPS /
+ *   setFeeBps / treasury) and ADDS the refund() + selfRefund() path the live
+ *   one lacks. The coordinator client (api/blockchain/escrow.py) already speaks
+ *   deposit/release/jobs, so this is the low-friction target for the board 9394
+ *   "redeploy V2 with refund/selfRefund". NOT yet deployed.
+ * @custom:fork ⚠️ A PARALLEL, INCOMPATIBLE escrow exists in this repo —
+ *   MyAIEscrow.sol (lockPayment / releasePayment / refundPayment / claimExpired
+ *   / escrows) — which is the contract listed in the audit scope (card 9400).
+ *   The two cannot both be canonical. Reconcile before audit + redeploy; see
+ *   9394_escrow_redeploy_plan.md. Tests intentionally target MyAIEscrow today.
  *
  * @notice Holds MYAI tokens in escrow per job, releases them to the agent on
  *         completion, applying a configurable protocol fee split between a
