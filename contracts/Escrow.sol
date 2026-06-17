@@ -2,7 +2,14 @@
 pragma solidity ^0.8.17;
 
 /**
- * @title MyAi Protocol Escrow
+ * @title MyAi Protocol Escrow (LEGACY — DEPRECATED)
+ * @custom:deprecated Superseded by MyAIEscrow.sol. This is the source of the
+ *   originally-deployed escrow (Base 0x280Be8…); it LACKS refund()/selfRefund().
+ *   Kept only for provenance of the live bytecode. NOT in the audit scope and
+ *   intentionally untested — do NOT deploy. The canonical escrow is MyAIEscrow
+ *   (refund/selfRefund + adjustable fee); see board card 9394 for the V2
+ *   on-chain redeploy that replaces this contract.
+ *
  * @notice Holds MYAI tokens in escrow per job, releases them to the agent on
  *         completion, applying a configurable protocol fee split between a
  *         treasury address and the burn (dead) address.
