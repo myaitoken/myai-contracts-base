@@ -47,6 +47,11 @@ contract MyAIGovernance is Ownable, ReentrancyGuard {
     mapping(uint256 => Proposal) public proposals;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
 
+    /// @notice Block number snapshotted at each proposal's creation. Per-voter
+    ///         voting weight is measured as of this block so stake / governance
+    ///         points acquired later cannot swing the vote. Fixes #9686.
+    mapping(uint256 => uint256) public proposalSnapshotBlock;
+
     /// @dev Reverts when finalize() is called and participation < quorumBps.
     error QuorumNotMet(uint256 participationBps, uint256 requiredBps);
 
@@ -68,16 +73,15 @@ contract MyAIGovernance is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Sum voting weight across all registered agents. Used to snapshot the
-     *         quorum denominator at proposal-creation time.
-     * @dev O(N) over registeredAgents; bounded because agent set is on-chain registered.
+     * @notice Total eligible voting weight, used as the quorum denominator snapshot.
+     * @dev O(1): reads the running total maintained inside MyAIReputation instead of
+     *      iterating every registered agent. The previous O(N) loop over
+     *      registeredAgents was called from propose(); once the permissionless agent
+     *      set grew large enough, propose() exceeded the block gas limit and was
+     *      permanently bricked. Fixes audit #9687 (unbounded-loop propose() DoS).
      */
-    function getTotalEligibleVotingWeight() public view returns (uint256 total) {
-        uint256 n = reputation.totalAgents();
-        for (uint256 i = 0; i < n; i++) {
-            address agent = reputation.registeredAgents(i);
-            total += getVotingWeight(agent);
-        }
+    function getTotalEligibleVotingWeight() public view returns (uint256) {
+        return reputation.totalVotingWeight();
     }
 
     function propose(
@@ -109,6 +113,7 @@ contract MyAIGovernance is Ownable, ReentrancyGuard {
             eligibleVotingWeight: eligible,
             status: ProposalStatus.Active
         });
+        proposalSnapshotBlock[id] = block.number;
 
         emit ProposalCreated(id, msg.sender, title, eligible);
         return id;
@@ -120,7 +125,10 @@ contract MyAIGovernance is Ownable, ReentrancyGuard {
         require(block.timestamp <= p.votingEndsAt, "Voting ended");
         require(!hasVoted[proposalId][msg.sender], "Already voted");
 
-        uint256 weight = getVotingWeight(msg.sender);
+        // Snapshot voting: count weight as of the proposal-creation block, so an
+        // attacker cannot flash-stake / farm points AFTER a proposal exists to swing
+        // the vote, then unwind. Fixes audit #9686 (flash-stake takeover).
+        uint256 weight = reputation.getPastVotingWeight(msg.sender, proposalSnapshotBlock[proposalId]);
         require(weight > 0, "No voting weight");
 
         hasVoted[proposalId][msg.sender] = true;

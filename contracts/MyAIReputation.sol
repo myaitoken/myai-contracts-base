@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 
 /**
  * @title MyAIReputation
@@ -15,6 +16,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
  */
 contract MyAIReputation is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using Checkpoints for Checkpoints.Trace208;
     address public coordinator;
     IERC20 public immutable myaiToken;
 
@@ -48,6 +50,19 @@ contract MyAIReputation is Ownable, ReentrancyGuard {
     mapping(address => AgentProfile) public profiles;
     address[] public registeredAgents;
 
+    /// @notice Running sum of every agent's current voting weight
+    ///         (governancePoints + stakedAmount / 1e18). Maintained incrementally
+    ///         so governance can read the quorum denominator in O(1) instead of
+    ///         iterating every registered agent. Fixes audit #9687 (unbounded
+    ///         on-chain loop -> permanent propose() DoS).
+    uint256 public totalVotingWeight;
+
+    /// @notice Block-numbered history of each agent's voting weight. Governance
+    ///         measures a voter's weight as of a proposal's snapshot block, so
+    ///         stake / governance points acquired AFTER proposal creation cannot
+    ///         swing a live vote. Fixes audit #9686 (flash-stake takeover).
+    mapping(address => Checkpoints.Trace208) private _weightCheckpoints;
+
     event AgentRegistered(address indexed agent, uint256 timestamp);
     event JobRecorded(address indexed provider, bool pocPassed, uint256 newScore);
     event AgentSlashed(address indexed agent, uint256 penalty, uint256 cooldownUntil);
@@ -73,6 +88,7 @@ contract MyAIReputation is Ownable, ReentrancyGuard {
         profiles[msg.sender].registeredAt = block.timestamp;
         profiles[msg.sender].lastUpdated = block.timestamp;
         registeredAgents.push(msg.sender);
+        _syncVotingWeight(msg.sender);
         emit AgentRegistered(msg.sender, block.timestamp);
     }
 
@@ -135,6 +151,7 @@ contract MyAIReputation is Ownable, ReentrancyGuard {
             p.reputationScore = successScore + pocScore + latencyScore;
         }
 
+        _syncVotingWeight(provider);
         emit JobRecorded(provider, pocPassed, p.reputationScore);
     }
 
@@ -151,6 +168,8 @@ contract MyAIReputation is Ownable, ReentrancyGuard {
             profiles[msg.sender].reputationScore + boost > 10000
             ? 10000
             : profiles[msg.sender].reputationScore + boost;
+        // Checkpoint the new voting weight before the external interaction (CEI).
+        _syncVotingWeight(msg.sender);
         // Interaction last
         myaiToken.safeTransferFrom(msg.sender, address(this), amount);
         emit Staked(msg.sender, amount);
@@ -205,6 +224,39 @@ contract MyAIReputation is Ownable, ReentrancyGuard {
         require(_coordinator != address(0), "Zero address");
         coordinator = _coordinator;
         emit CoordinatorUpdated(_coordinator);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Voting-weight accounting (governance snapshot support)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Current voting weight of an agent: governance points + staked whole
+    ///      tokens. Mirrors MyAIGovernance.getVotingWeight so the two never drift.
+    function _currentVotingWeight(address agent) internal view returns (uint256) {
+        AgentProfile storage p = profiles[agent];
+        return p.governancePoints + p.stakedAmount / 1e18;
+    }
+
+    /// @dev Record a checkpoint whenever an agent's voting weight changes and keep
+    ///      the running total in sync. Same-block updates overwrite the value at
+    ///      the existing key, so a snapshot always reflects the final weight for
+    ///      its block.
+    function _syncVotingWeight(address agent) internal {
+        uint256 newWeight = _currentVotingWeight(agent);
+        uint256 oldWeight = _weightCheckpoints[agent].latest();
+        if (newWeight == oldWeight) return;
+        // totalVotingWeight already includes this agent's oldWeight contribution.
+        totalVotingWeight = totalVotingWeight - oldWeight + newWeight;
+        _weightCheckpoints[agent].push(uint48(block.number), uint208(newWeight));
+    }
+
+    /// @notice Voting weight of `agent` as of `blockNumber` (inclusive). Governance
+    ///         snapshots voting power at proposal creation with this, so weight
+    ///         acquired in later blocks (flash-stake) does not count. Fixes #9686.
+    function getPastVotingWeight(address agent, uint256 blockNumber)
+        external view returns (uint256)
+    {
+        return _weightCheckpoints[agent].upperLookup(uint48(blockNumber));
     }
 
     function totalAgents() external view returns (uint256) {
