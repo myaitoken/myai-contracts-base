@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.17;
+pragma solidity ^0.8.20;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
  * @title MyAi Protocol Escrow  (deposit/release line — ALTERNATIVE, NOT SELECTED)
@@ -15,7 +18,7 @@ pragma solidity ^0.8.17;
  *         completion, applying a configurable protocol fee split between a
  *         treasury address and the burn (dead) address.
  * @dev    Deployed on Base mainnet (chainId 8453).
- *         No external dependencies — fully self-contained.
+ *         Uses OpenZeppelin SafeERC20 for all token movements (audit #9711).
  *
  * Security changelog (audit remediation 2026-05-20)
  * --------------------------------------------------
@@ -43,17 +46,10 @@ pragma solidity ^0.8.17;
  */
 
 // ---------------------------------------------------------------------------
-// Minimal ERC-20 interface
-// ---------------------------------------------------------------------------
-interface IERC20 {
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function transfer(address to, uint256 amount) external returns (bool);
-}
-
-// ---------------------------------------------------------------------------
 // Escrow contract
 // ---------------------------------------------------------------------------
 contract Escrow {
+    using SafeERC20 for IERC20;
 
     // -----------------------------------------------------------------------
     // Constants
@@ -225,10 +221,7 @@ contract Escrow {
             pocHash:     bytes32(0)
         });
 
-        require(
-            token.transferFrom(msg.sender, address(this), amount),
-            "Escrow: transferFrom failed"
-        );
+        token.safeTransferFrom(msg.sender, address(this), amount);
 
         emit Deposited(jobId, agent, msg.sender, amount, _feeBps, _burnBps);
     }
@@ -254,23 +247,14 @@ contract Escrow {
         (uint256 providerAmount, uint256 burnAmount, uint256 feeAmount) =
             _computeSplit(job.amount, job.feeBps, job.burnBps);
 
-        require(
-            token.transfer(job.agent, providerAmount),
-            "Escrow: provider transfer failed"
-        );
+        token.safeTransfer(job.agent, providerAmount);
 
         if (burnAmount > 0) {
-            require(
-                token.transfer(DEAD, burnAmount),
-                "Escrow: burn transfer failed"
-            );
+            token.safeTransfer(DEAD, burnAmount);
         }
 
         if (feeAmount > 0) {
-            require(
-                token.transfer(treasury, feeAmount),
-                "Escrow: treasury transfer failed"
-            );
+            token.safeTransfer(treasury, feeAmount);
         }
 
         emit ProtocolFeeCharged(jobId, burnAmount, feeAmount);
@@ -293,10 +277,7 @@ contract Escrow {
         address depositor = job.depositor;
         job.refunded = true;
 
-        require(
-            token.transfer(depositor, job.amount),
-            "Escrow: refund transfer failed"
-        );
+        token.safeTransfer(depositor, job.amount);
 
         emit Refunded(jobId, depositor, job.amount);
     }
@@ -319,10 +300,7 @@ contract Escrow {
 
         job.refunded = true;
 
-        require(
-            token.transfer(job.depositor, job.amount),
-            "Escrow: self-refund transfer failed"
-        );
+        token.safeTransfer(job.depositor, job.amount);
 
         emit Refunded(jobId, job.depositor, job.amount);
     }
