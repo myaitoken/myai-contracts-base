@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 
 /**
@@ -15,7 +16,7 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
  *      20% of every payment is burned (BME mechanics).
  *      Protocol fee starts at 3% (feeBps=300) and is adjustable by owner (max 10%).
  */
-contract MyAIEscrow is ReentrancyGuard, Ownable, Pausable {
+contract MyAIEscrow is ReentrancyGuard, Ownable2Step, Pausable {
     using SafeERC20 for IERC20;
     IERC20 public immutable myaiToken;
     address public coordinator;  // Oracle: MyAI coordinator service
