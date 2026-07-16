@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 
 /**
  * @title MyAIReputation
@@ -15,6 +16,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
  */
 contract MyAIReputation is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using Checkpoints for Checkpoints.Trace208;
     address public coordinator;
     IERC20 public immutable myaiToken;
 
@@ -45,8 +47,42 @@ contract MyAIReputation is Ownable, ReentrancyGuard {
     uint256 public constant SLASH_COOLDOWN    = 48 hours;
     uint256 public constant GOVERNANCE_PER_JOB = 1;    // 1 gov point per verified job
 
+    // ── Anti-sybil (audit #9700) ─────────────────────────────────────────────
+    /// @notice Reputation a new agent starts with. Zero — reputation is EARNED
+    ///         through coordinator-verified work (recordCompletion), never granted
+    ///         for free at registration. Fixes audit #9700: previously register()
+    ///         set the max score (10000), so an attacker could mass-register free
+    ///         max-reputation identities and instantly clear the vouch threshold /
+    ///         dominate getTopProviders.
+    uint256 public constant INITIAL_REPUTATION = 0;
+    /// @notice Minimum time between two vouches by the same voucher. Rate-limits
+    ///         vouch spam so a single high-rep account cannot fan out trust to a
+    ///         swarm of sybils in one block. Owner may not lower below this floor.
+    uint256 public constant VOUCH_COOLDOWN = 1 days;
+
+    /// @notice Minimum stake a voucher must hold to vouch. Gives vouching an
+    ///         at-risk economic cost (audit #9700), so trust propagation is not
+    ///         free/permissionless. Owner-tunable; the exact figure is an economic
+    ///         parameter pending token-econ sign-off (see PR notes).
+    uint256 public minVouchStake = 1_000 * 1e18;
+    /// @notice Last time each address vouched (for VOUCH_COOLDOWN rate-limiting).
+    mapping(address => uint256) public lastVouchAt;
+
     mapping(address => AgentProfile) public profiles;
     address[] public registeredAgents;
+
+    /// @notice Running sum of every agent's current voting weight
+    ///         (governancePoints + stakedAmount / 1e18). Maintained incrementally
+    ///         so governance can read the quorum denominator in O(1) instead of
+    ///         iterating every registered agent. Fixes audit #9687 (unbounded
+    ///         on-chain loop -> permanent propose() DoS).
+    uint256 public totalVotingWeight;
+
+    /// @notice Block-numbered history of each agent's voting weight. Governance
+    ///         measures a voter's weight as of a proposal's snapshot block, so
+    ///         stake / governance points acquired AFTER proposal creation cannot
+    ///         swing a live vote. Fixes audit #9686 (flash-stake takeover).
+    mapping(address => Checkpoints.Trace208) private _weightCheckpoints;
 
     event AgentRegistered(address indexed agent, uint256 timestamp);
     event JobRecorded(address indexed provider, bool pocPassed, uint256 newScore);
@@ -69,10 +105,11 @@ contract MyAIReputation is Ownable, ReentrancyGuard {
 
     function register() external {
         require(profiles[msg.sender].registeredAt == 0, "Already registered");
-        profiles[msg.sender].reputationScore = 10000; // Start at 100.00
+        profiles[msg.sender].reputationScore = INITIAL_REPUTATION; // earn it; no free max score (audit #9700)
         profiles[msg.sender].registeredAt = block.timestamp;
         profiles[msg.sender].lastUpdated = block.timestamp;
         registeredAgents.push(msg.sender);
+        _syncVotingWeight(msg.sender);
         emit AgentRegistered(msg.sender, block.timestamp);
     }
 
@@ -87,9 +124,11 @@ contract MyAIReputation is Ownable, ReentrancyGuard {
     ) external onlyCoordinator {
         AgentProfile storage p = profiles[provider];
 
-        // Auto-register if not registered
+        // Auto-register if not registered. Start at the earned-from-zero floor;
+        // the score recalculation below immediately sets it from real job stats
+        // (audit #9700 — no free max score on first sight of an agent).
         if (p.registeredAt == 0) {
-            p.reputationScore = 10000;
+            p.reputationScore = INITIAL_REPUTATION;
             p.registeredAt = block.timestamp;
             registeredAgents.push(provider);
         }
@@ -135,6 +174,7 @@ contract MyAIReputation is Ownable, ReentrancyGuard {
             p.reputationScore = successScore + pocScore + latencyScore;
         }
 
+        _syncVotingWeight(provider);
         emit JobRecorded(provider, pocPassed, p.reputationScore);
     }
 
@@ -151,6 +191,8 @@ contract MyAIReputation is Ownable, ReentrancyGuard {
             profiles[msg.sender].reputationScore + boost > 10000
             ? 10000
             : profiles[msg.sender].reputationScore + boost;
+        // Checkpoint the new voting weight before the external interaction (CEI).
+        _syncVotingWeight(msg.sender);
         // Interaction last
         myaiToken.safeTransferFrom(msg.sender, address(this), amount);
         emit Staked(msg.sender, amount);
@@ -160,18 +202,32 @@ contract MyAIReputation is Ownable, ReentrancyGuard {
      * @notice Vouch for another agent — trust propagation.
      */
     function vouch(address vouchee) external {
-        AgentProfile storage voucher = profiles[msg.sender];
-        require(voucher.reputationScore >= 9000, "Reputation too low to vouch");
         require(msg.sender != vouchee, "Cannot vouch for self");
+
+        AgentProfile storage voucher = profiles[msg.sender];
+        // Voucher must have EARNED high reputation — a fresh/free account starts at
+        // INITIAL_REPUTATION (0) and can never clear this on registration alone.
+        require(voucher.reputationScore >= 9000, "Reputation too low to vouch");
+        // Vouching carries an at-risk economic cost, so it is not permissionless
+        // (audit #9700): a voucher must hold real stake to propagate trust.
+        require(voucher.stakedAmount >= minVouchStake, "Insufficient stake to vouch");
 
         AgentProfile storage voucheeProfile = profiles[vouchee];
         for (uint i = 0; i < voucheeProfile.vouchedBy.length; i++) {
             require(voucheeProfile.vouchedBy[i] != msg.sender, "Already vouched");
         }
 
+        // Rate-limit: a single voucher cannot fan trust out to a swarm of sybils
+        // within one cooldown window (audit #9700).
+        require(
+            lastVouchAt[msg.sender] == 0 || block.timestamp >= lastVouchAt[msg.sender] + VOUCH_COOLDOWN,
+            "Vouch cooldown active"
+        );
+        lastVouchAt[msg.sender] = block.timestamp;
+
         voucheeProfile.vouchedBy.push(msg.sender);
         if (voucheeProfile.reputationScore < 9900) {
-            voucheeProfile.reputationScore += 100; // +1% per vouch from 90+ rep agent
+            voucheeProfile.reputationScore += 100; // +1% per vouch from a staked, high-rep agent
         }
 
         emit AgentVouched(msg.sender, vouchee);
@@ -200,11 +256,54 @@ contract MyAIReputation is Ownable, ReentrancyGuard {
     }
 
     event CoordinatorUpdated(address indexed newCoordinator);
+    event MinVouchStakeUpdated(uint256 newMinVouchStake);
 
     function setCoordinator(address _coordinator) external onlyOwner {
         require(_coordinator != address(0), "Zero address");
         coordinator = _coordinator;
         emit CoordinatorUpdated(_coordinator);
+    }
+
+    /// @notice Tune the minimum voucher stake (audit #9700 anti-sybil economic
+    ///         parameter). Owner-gated; requires a non-zero floor so vouching can
+    ///         never become permissionless again.
+    function setMinVouchStake(uint256 newMinVouchStake) external onlyOwner {
+        require(newMinVouchStake > 0, "Stake floor must be > 0");
+        minVouchStake = newMinVouchStake;
+        emit MinVouchStakeUpdated(newMinVouchStake);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Voting-weight accounting (governance snapshot support)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// @dev Current voting weight of an agent: governance points + staked whole
+    ///      tokens. Mirrors MyAIGovernance.getVotingWeight so the two never drift.
+    function _currentVotingWeight(address agent) internal view returns (uint256) {
+        AgentProfile storage p = profiles[agent];
+        return p.governancePoints + p.stakedAmount / 1e18;
+    }
+
+    /// @dev Record a checkpoint whenever an agent's voting weight changes and keep
+    ///      the running total in sync. Same-block updates overwrite the value at
+    ///      the existing key, so a snapshot always reflects the final weight for
+    ///      its block.
+    function _syncVotingWeight(address agent) internal {
+        uint256 newWeight = _currentVotingWeight(agent);
+        uint256 oldWeight = _weightCheckpoints[agent].latest();
+        if (newWeight == oldWeight) return;
+        // totalVotingWeight already includes this agent's oldWeight contribution.
+        totalVotingWeight = totalVotingWeight - oldWeight + newWeight;
+        _weightCheckpoints[agent].push(uint48(block.number), uint208(newWeight));
+    }
+
+    /// @notice Voting weight of `agent` as of `blockNumber` (inclusive). Governance
+    ///         snapshots voting power at proposal creation with this, so weight
+    ///         acquired in later blocks (flash-stake) does not count. Fixes #9686.
+    function getPastVotingWeight(address agent, uint256 blockNumber)
+        external view returns (uint256)
+    {
+        return _weightCheckpoints[agent].upperLookup(uint48(blockNumber));
     }
 
     function totalAgents() external view returns (uint256) {
