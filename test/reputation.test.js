@@ -17,10 +17,10 @@ describe("MyAIReputation", function () {
     await reputation.waitForDeployment();
   });
 
-  it("should register agent with score 10000", async function () {
+  it("should register agent with score 0 (earned, not free)", async function () {
     await reputation.connect(provider1).register();
     const profile = await reputation.getProfile(provider1.address);
-    expect(profile.reputationScore).to.equal(10000);
+    expect(profile.reputationScore).to.equal(0);
     expect(profile.totalJobs).to.equal(0);
   });
 

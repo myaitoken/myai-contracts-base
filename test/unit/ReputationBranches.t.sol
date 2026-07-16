@@ -33,6 +33,18 @@ contract ReputationBranchesTest is Test {
         token.approve(address(rep), type(uint256).max);
     }
 
+    /// @dev Make `who` a legitimate voucher under the hardened contract (audit
+    ///      #9700): earn high reputation via a coordinator-verified job, then post
+    ///      the required vouch stake.
+    function _makeLegitVoucher(address who) internal {
+        vm.prank(coordinator);
+        rep.recordCompletion(who, true, 100, 100); // one fast success -> score ~9993
+        uint256 need = rep.minVouchStake();
+        _fundApprove(who, need);
+        vm.prank(who);
+        rep.stake(need);
+    }
+
     // ── Constructor ─────────────────────────────────────────────────────────
     function test_ctor_revertsCoordinatorZero() public {
         vm.expectRevert(bytes("Coordinator zero"));
@@ -74,11 +86,13 @@ contract ReputationBranchesTest is Test {
     }
 
     function test_stake_boostCappedAndScoreCapped() public {
-        vm.prank(a1);
-        rep.register(); // score 10000
+        // Earn near-max reputation first (agents no longer start at max — audit
+        // #9700), so the stake boost still exercises the 10000 score cap.
+        vm.prank(coordinator);
+        rep.recordCompletion(a1, true, 1, 100); // score ~9999
         _fundApprove(a1, 1_000 ether);
         vm.prank(a1);
-        rep.stake(1_000 ether); // boost = 1000*10 = 10000 -> capped 500; 10000+500 -> capped 10000
+        rep.stake(1_000 ether); // boost = 1000*10 = 10000 -> capped 500; 9999+500 -> capped 10000
         MyAIReputation.AgentProfile memory p = rep.getProfile(a1);
         assertEq(p.reputationScore, 10000);
         assertEq(p.stakedAmount, 1_000 ether);
@@ -111,8 +125,7 @@ contract ReputationBranchesTest is Test {
     }
 
     function test_vouch_revertsAlready() public {
-        vm.prank(a1);
-        rep.register();
+        _makeLegitVoucher(a1);
         vm.prank(a2);
         rep.register();
         vm.prank(a1);
@@ -123,11 +136,8 @@ contract ReputationBranchesTest is Test {
     }
 
     function test_vouch_succeedsBumpsScore() public {
-        vm.prank(a1);
-        rep.register();
-        vm.prank(a2);
-        rep.register(); // a2 score 10000 -> >= 9900 so NO bump branch
-        // Use a fresh low-score vouchee to exercise the (< 9900) bump branch:
+        _makeLegitVoucher(a1); // earned high rep + posted stake (audit #9700)
+        // Fresh low-score vouchee to exercise the (< 9900) bump branch:
         vm.prank(coordinator);
         rep.recordCompletion(stranger, false, 0, 0); // stranger score 2000 (< 9900)
         vm.prank(a1);

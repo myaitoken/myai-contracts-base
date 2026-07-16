@@ -19,10 +19,27 @@ contract ReputationUnitTest is Test {
         token.approve(address(rep), type(uint256).max);
     }
 
+    /// @dev Turn `who` into a legitimate voucher for the hardened contract
+    ///      (audit #9700): earn high reputation via a coordinator-verified job,
+    ///      then post the required vouch stake.
+    function _makeLegitVoucher(address who) internal {
+        vm.prank(coordinator);
+        rep.recordCompletion(who, true, 100, 100); // one fast success -> score ~9993
+        uint256 need = rep.minVouchStake();
+        if (token.balanceOf(who) < need) token.transfer(who, need);
+        vm.startPrank(who);
+        token.approve(address(rep), need);
+        rep.stake(need);
+        vm.stopPrank();
+        assertGe(rep.getProfile(who).reputationScore, 9000);
+        assertGe(rep.getProfile(who).stakedAmount, need);
+    }
+
     function test_register() public {
         vm.prank(provider);
         rep.register();
-        assertEq(rep.getProfile(provider).reputationScore, 10_000);
+        // audit #9700: new agents start at the earned-from-zero floor, not max.
+        assertEq(rep.getProfile(provider).reputationScore, 0);
     }
 
     function test_registerTwiceReverts() public {
@@ -90,20 +107,18 @@ contract ReputationUnitTest is Test {
     }
 
     function test_vouchHappyPath() public {
-        vm.prank(provider);
-        rep.register();
+        _makeLegitVoucher(provider); // earned high rep + posted stake (audit #9700)
         address other = address(0xEE);
         vm.prank(other);
-        rep.register();
+        rep.register(); // starts at 0 now
         vm.prank(provider);
         rep.vouch(other);
-        // other was 10000, no change because already maxed
-        assertEq(rep.getProfile(other).reputationScore, 10_000);
+        // vouchee gains +100 from a staked, high-rep voucher
+        assertEq(rep.getProfile(other).reputationScore, 100);
     }
 
     function test_vouchTwiceReverts() public {
-        vm.prank(provider);
-        rep.register();
+        _makeLegitVoucher(provider);
         address other = address(0xEE);
         vm.prank(other);
         rep.register();
