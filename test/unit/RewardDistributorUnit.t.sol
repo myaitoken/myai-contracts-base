@@ -90,14 +90,17 @@ contract RewardDistributorUnitTest is Test {
     }
 
     // ─── Admin ──────────────────────────────────────────────────────────────
-    function test_setMerkleRoot_onlyOwner() public {
+    function test_proposeMerkleRoot_onlyOwner() public {
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", stranger));
-        dist.setMerkleRoot(bytes32(uint256(1)));
+        dist.proposeMerkleRoot(bytes32(uint256(1)));
     }
 
-    function test_setMerkleRoot_updates() public {
-        dist.setMerkleRoot(bytes32(uint256(0xABC)));
+    // Root now changes only through the propose -> delay -> apply timelock (#9709).
+    function test_merkleRoot_updatesViaTimelock() public {
+        dist.proposeMerkleRoot(bytes32(uint256(0xABC)));
+        vm.warp(block.timestamp + dist.ROOT_UPDATE_DELAY());
+        dist.applyMerkleRoot();
         assertEq(dist.merkleRoot(), bytes32(uint256(0xABC)));
     }
 

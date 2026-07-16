@@ -21,6 +21,16 @@ import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
  *      Leaf = keccak256(abi.encodePacked(index, account, amount)); off-chain
  *      tooling must build the tree with the same encoding and sorted-pair
  *      hashing (OZ MerkleProof).
+ *
+ * @dev SECURITY (audit #9709 — PRE-AUDIT, not deployed on-chain): the Merkle
+ *      root is no longer owner-mutable in a single instant transaction. Any
+ *      root change after deployment must go through a two-step timelock —
+ *      proposeMerkleRoot() then applyMerkleRoot() after ROOT_UPDATE_DELAY —
+ *      giving claimants a fixed, observable window to verify or exit before
+ *      allocations can change (removes the instant rug/grief vector). Only the
+ *      genesis root is set instantly, once, in the constructor. Owners that want
+ *      an external governance timelock can additionally transfer ownership to a
+ *      Timelock contract; the in-contract delay applies regardless.
  */
 contract MyAIRewardDistributor is Ownable {
     using SafeERC20 for IERC20;
@@ -29,10 +39,20 @@ contract MyAIRewardDistributor is Ownable {
     bytes32 public merkleRoot;
     uint256 public claimDeadline; // 0 = no deadline (sweep disabled)
 
+    /// @notice Mandatory delay between proposing and applying a Merkle-root change.
+    uint256 public constant ROOT_UPDATE_DELAY = 2 days;
+
+    /// @notice Root awaiting the timelock. Meaningful only while pendingRootEta != 0.
+    bytes32 public pendingMerkleRoot;
+    /// @notice Earliest timestamp a pending root may be applied. 0 == none pending.
+    uint256 public pendingRootEta;
+
     mapping(uint256 => uint256) private claimedBitMap;
 
     event Claimed(uint256 indexed index, address indexed account, uint256 amount);
     event MerkleRootUpdated(bytes32 oldRoot, bytes32 newRoot);
+    event MerkleRootUpdateProposed(bytes32 indexed newRoot, uint256 eta);
+    event MerkleRootUpdateCancelled(bytes32 pendingRoot);
     event ClaimDeadlineUpdated(uint256 deadline);
     event Swept(address indexed to, uint256 amount);
 
@@ -40,6 +60,8 @@ contract MyAIRewardDistributor is Ownable {
     error InvalidProof();
     error ClaimWindowClosed();
     error SweepNotAllowedYet();
+    error NoPendingRootUpdate();
+    error RootTimelockNotElapsed();
 
     constructor(address _token, bytes32 _merkleRoot, uint256 _claimDeadline) Ownable(msg.sender) {
         require(_token != address(0), "Token zero");
@@ -79,9 +101,33 @@ contract MyAIRewardDistributor is Ownable {
     }
 
     // ─── Admin ──────────────────────────────────────────────────────────────
-    function setMerkleRoot(bytes32 _root) external onlyOwner {
-        emit MerkleRootUpdated(merkleRoot, _root);
-        merkleRoot = _root;
+
+    /// @notice Step 1/2 — schedule a Merkle-root change. It cannot take effect
+    ///         until at least ROOT_UPDATE_DELAY has passed. Re-proposing
+    ///         overwrites any pending root and restarts the delay.
+    function proposeMerkleRoot(bytes32 _root) external onlyOwner {
+        pendingMerkleRoot = _root;
+        pendingRootEta = block.timestamp + ROOT_UPDATE_DELAY;
+        emit MerkleRootUpdateProposed(_root, pendingRootEta);
+    }
+
+    /// @notice Step 2/2 — apply a previously-proposed Merkle root once its
+    ///         timelock has elapsed.
+    function applyMerkleRoot() external onlyOwner {
+        if (pendingRootEta == 0) revert NoPendingRootUpdate();
+        if (block.timestamp < pendingRootEta) revert RootTimelockNotElapsed();
+        emit MerkleRootUpdated(merkleRoot, pendingMerkleRoot);
+        merkleRoot = pendingMerkleRoot;
+        pendingMerkleRoot = bytes32(0);
+        pendingRootEta = 0;
+    }
+
+    /// @notice Cancel a pending Merkle-root change before it is applied.
+    function cancelMerkleRootUpdate() external onlyOwner {
+        if (pendingRootEta == 0) revert NoPendingRootUpdate();
+        emit MerkleRootUpdateCancelled(pendingMerkleRoot);
+        pendingMerkleRoot = bytes32(0);
+        pendingRootEta = 0;
     }
 
     function setClaimDeadline(uint256 _deadline) external onlyOwner {
