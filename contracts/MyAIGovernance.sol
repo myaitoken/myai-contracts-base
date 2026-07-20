@@ -61,9 +61,29 @@ contract MyAIGovernance is Ownable, ReentrancyGuard {
     event ProposalFailed(uint256 indexed id);
     event ProposalExecuted(uint256 indexed id);
 
+    /// @notice Owner-curated allowlist of contracts a passed proposal may call in
+    ///         execute(). Without it, execute() would make an arbitrary external
+    ///         call to any proposer-encoded (target, callData) — e.g. draining
+    ///         funds, granting roles, or self-upgrading. The owner is intended to be
+    ///         the MyAITimelock + multisig, and can flip a target off during the 48h
+    ///         execution timelock to defuse a malicious-but-passed proposal.
+    ///         Fixes audit #9670 (arbitrary-call execute()).
+    mapping(address => bool) public allowedTarget;
+
+    event TargetAllowed(address indexed target, bool allowed);
+
     constructor(address _reputation) Ownable(msg.sender) {
         require(_reputation != address(0), "Reputation zero");
         reputation = MyAIReputation(_reputation);
+    }
+
+    /// @notice Owner adds/removes a contract from the execute() target allowlist.
+    /// @dev Owner is intended to be the MyAITimelock + multisig. address(0) can never
+    ///      be allowlisted — it is the sentinel for no-op / signaling proposals.
+    function setTargetAllowed(address target, bool allowed) external onlyOwner {
+        require(target != address(0), "Zero target");
+        allowedTarget[target] = allowed;
+        emit TargetAllowed(target, allowed);
     }
 
     function getVotingWeight(address agent) public view returns (uint256) {
@@ -186,6 +206,13 @@ contract MyAIGovernance is Ownable, ReentrancyGuard {
         p.status = ProposalStatus.Executed;
 
         if (p.target != address(0) && p.callData.length > 0) {
+            // Arbitrary-call hardening (#9670): a passed proposal may only call a
+            // target the owner (Timelock+multisig) has explicitly allowlisted. The
+            // check is at execution time, so the owner can revoke a target during
+            // the 48h timelock to neutralise a malicious proposal that slipped
+            // through voting. Together with the timelock delay and nonReentrant,
+            // execute() can no longer make an unconstrained external call.
+            require(allowedTarget[p.target], "Target not allowlisted");
             (bool success,) = p.target.call(p.callData);
             require(success, "Execution failed");
         }

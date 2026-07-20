@@ -82,6 +82,7 @@ contract GovernanceBranchesTest is Test {
         _GovTarget tgt = new _GovTarget();
         bytes memory cd = abi.encodeWithSignature("setX(uint256)", uint256(42));
         uint256 start = block.timestamp;
+        gov.setTargetAllowed(address(tgt), true);
         uint256 id = _proposeWith(address(tgt), cd);
         vm.prank(voter1);
         gov.vote(id, true);
@@ -99,6 +100,7 @@ contract GovernanceBranchesTest is Test {
         _GovTarget tgt = new _GovTarget();
         bytes memory cd = abi.encodeWithSignature("boom()");
         uint256 start = block.timestamp;
+        gov.setTargetAllowed(address(tgt), true);
         uint256 id = _proposeWith(address(tgt), cd);
         vm.prank(voter1);
         gov.vote(id, true);
@@ -107,5 +109,53 @@ contract GovernanceBranchesTest is Test {
         vm.warp(start + 3 days + 48 hours + 1);
         vm.expectRevert(bytes("Execution failed"));
         gov.execute(id);
+    }
+
+    // ── #9670: execute() to a NON-allowlisted target is blocked ──────────────────
+    function test_9670_arbitraryCallBlockedWhenNotAllowlisted() public {
+        _GovTarget tgt = new _GovTarget();
+        bytes memory cd = abi.encodeWithSignature("setX(uint256)", uint256(42));
+        uint256 start = block.timestamp;
+        // NOTE: target deliberately NOT allowlisted.
+        uint256 id = _proposeWith(address(tgt), cd);
+        vm.prank(voter1);
+        gov.vote(id, true);
+        vm.warp(start + 3 days + 1);
+        gov.finalize(id); // -> Passed
+        vm.warp(start + 3 days + 48 hours + 1);
+        vm.expectRevert(bytes("Target not allowlisted"));
+        gov.execute(id);
+        assertEq(tgt.x(), 0, "arbitrary call must not have executed");
+    }
+
+    // ── #9670: owner can revoke a target during the timelock to defuse a proposal ──
+    function test_9670_ownerRevokeDuringTimelockBlocksExecution() public {
+        _GovTarget tgt = new _GovTarget();
+        bytes memory cd = abi.encodeWithSignature("setX(uint256)", uint256(42));
+        uint256 start = block.timestamp;
+        gov.setTargetAllowed(address(tgt), true);
+        uint256 id = _proposeWith(address(tgt), cd);
+        vm.prank(voter1);
+        gov.vote(id, true);
+        vm.warp(start + 3 days + 1);
+        gov.finalize(id); // -> Passed
+        // Owner spots the malicious proposal and revokes the target mid-timelock.
+        gov.setTargetAllowed(address(tgt), false);
+        vm.warp(start + 3 days + 48 hours + 1);
+        vm.expectRevert(bytes("Target not allowlisted"));
+        gov.execute(id);
+    }
+
+    // ── #9670: setTargetAllowed is owner-only and rejects the zero sentinel ─────
+    function test_9670_setTargetAllowedOnlyOwner() public {
+        _GovTarget tgt = new _GovTarget();
+        vm.prank(voter1);
+        vm.expectRevert();
+        gov.setTargetAllowed(address(tgt), true);
+    }
+
+    function test_9670_setTargetAllowedRejectsZero() public {
+        vm.expectRevert(bytes("Zero target"));
+        gov.setTargetAllowed(address(0), true);
     }
 }
